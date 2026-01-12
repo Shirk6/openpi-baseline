@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.we_policy as we_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -276,6 +277,67 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             action_sequence_keys=self.action_sequence_keys,
         )
 
+@dataclasses.dataclass(frozen=True)
+class DualYamDataConfig(DataConfigFactory):
+    """Data class for dual-arm yam system."""
+
+    # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
+    # Gripper dimensions will remain in absolute values.
+    use_delta_joint_actions: bool = True
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None
+    # If true, this will convert the joint and gripper values from the standard Aloha space to
+    # the space used by the pi internal runtime which was used to train the base model. People who
+    # use standard Aloha data should set this to true.
+    adapt_to_pi: bool = True
+
+    # Repack transforms.
+    repack_transforms: _transforms.Group = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.cam_high",
+                            "cam_left_wrist": "observation.images.cam_left_wrist",
+                            "cam_right_wrist": "observation.images.cam_right_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "task",
+                    }
+                )
+            ]
+        )
+    )
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Prepare data for policy training
+        # Convert images to uint8 numpy arrays, add masks
+        data_transforms = _transforms.Group(
+            inputs=[we_policy.YamInputs(action_dim=model_config.action_dim, adapt_to_pi=self.adapt_to_pi, model_type=model_config.model_type)],
+            outputs=[we_policy.YamOutputs(adapt_to_pi=self.adapt_to_pi)],
+        )
+        if self.use_delta_joint_actions:
+            # Left and right arm joints use delta actions, grippers use absolute actions
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)], # Convert to delta actions
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)], # Convert back to absolute actions during inference
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotLiberoDataConfig(DataConfigFactory):
@@ -549,6 +611,43 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
+    # WE d900 training configs
+    TrainConfig(
+        name="we_wrap_toy_abs_pi0",
+        model=pi0_config.Pi0Config(
+            action_horizon=60,
+        ),
+        data=DualYamDataConfig(
+            repo_id="d900/wrap_toy_483",
+            assets="dual_yam",
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=False,
+            adapt_to_pi=False
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(""),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=64,
+        save_interval=5000
+    ),
+    TrainConfig(
+        name="we_wrap_toy_relative_pi0",
+        model=pi0_config.Pi0Config(
+            action_horizon=60,
+        ),
+        data=DualYamDataConfig(
+            repo_id="d900/wrap_toy_483",
+            assets="dual_yam",
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=True,
+            adapt_to_pi=False
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(""),
+        num_train_steps=30_000,
+        batch_size=32,
+        num_workers=64,
+        save_interval=5000
+    ),
     #
     # Inference Aloha configs.
     #
