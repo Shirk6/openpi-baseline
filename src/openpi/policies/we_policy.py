@@ -97,7 +97,7 @@ class YamInputs(transforms.DataTransformFn):
 
         # Map images based on model type
         match self.model_type:
-            case _model.ModelType.PI0:
+            case _model.ModelType.PI0 | _model.ModelType.PI05:
                 images = {"base_0_rgb": base_image}
                 image_masks = {"base_0_rgb": np.True_}
                 # Add the extra images for PI0

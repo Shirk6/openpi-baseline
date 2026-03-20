@@ -625,10 +625,28 @@ _CONFIGS = [
             adapt_to_pi=False
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/sdzhang/model/openpi/openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=30_000,
+        num_train_steps=200_000,
         batch_size=32,
         num_workers=64,
-        save_interval=5000
+        save_interval=10000
+    ),
+    TrainConfig(
+        name="we_coffee_pods_organization_abs_pi0",
+        model=pi0_config.Pi0Config(
+            action_horizon=60,
+        ),
+        data=DualYamDataConfig(
+            repo_id="we_d900/coffee-pods-organization_v21",
+            # assets=AssetsConfig()
+            base_config=DataConfig(prompt_from_task=True, local_files_path="/inspire/hdd/global_user/gongjingjing-25039/sdzhang/dataset/lerobot/we_d900/coffee-pods-organization_v21"),
+            use_delta_joint_actions=False,
+            adapt_to_pi=False
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/sdzhang/model/openpi/openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=100_000,
+        batch_size=32,
+        num_workers=64,
+        save_interval=10000
     ),
     TrainConfig(
         name="we_wrap_toy_relative_pi0",
@@ -643,10 +661,43 @@ _CONFIGS = [
             adapt_to_pi=False
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/sdzhang/model/openpi/openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=30_000,
+        num_train_steps=200_000,
         batch_size=32,
         num_workers=64,
-        save_interval=5000
+        save_interval=10000
+    ),
+    TrainConfig(
+        name="we_wrap_toy_relative_pi0_adapted",
+        model=pi0_config.Pi0Config(
+            action_horizon=60,
+        ),
+        data=DualYamDataConfig(
+            repo_id="d900/wrap_toy_483_old",
+            # assets="dual_yam",
+            base_config=DataConfig(prompt_from_task=True,  local_files_path="/inspire/hdd/global_user/gongjingjing-25039/sdzhang/dataset/worldengine/we_lerobot_data/d900/wrap_toy_483_old"),
+            use_delta_joint_actions=True,
+            adapt_to_pi=True
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/sdzhang/model/openpi/openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=200_000,
+        batch_size=32,
+        num_workers=64,
+        save_interval=10000
+    ),
+    TrainConfig(
+        name="pi05_insert-mouse-battery",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=DualYamDataConfig(
+            repo_id="v21/insert-mouse-battery",
+            base_config=DataConfig(prompt_from_task=True,  local_files_path="/inspire/hdd/global_user/gongjingjing-25039/sdzhang/dataset/lerobot/v21/insert-mouse-battery"),
+            use_delta_joint_actions=True,
+            adapt_to_pi=True
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/global_user/gongjingjing-25039/sdzhang/model/openpi/openpi-assets/checkpoints/pi05_base/params/"),
+        num_train_steps=200_000,
+        batch_size=32,
+        num_workers=64,
+        save_interval=40_000
     ),
     #
     # Inference Aloha configs.
