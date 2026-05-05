@@ -1,3 +1,53 @@
+# RSS2026 Workshop Baseline Guidance
+
+This repository is the baseline for the RSS 2026 Post-Training for Robot Foundation Models workshop challenge. The three challenge tasks are pre-registered as training configs:
+
+- `pi05_insert-mouse-battery`
+- `pi05_seal-water-bottle-cap`
+- `pi05_tower-of-hanoi-game`
+
+Follow the three steps below to reproduce the baseline.
+
+### 1. Configure dataset paths
+
+Open [`src/openpi/training/config.py`](src/openpi/training/config.py) and edit the three challenge configs at **lines 615-660**. Replace the `/Your/path/to/...` placeholder in each config's `local_files_path` with the actual location of the challenge dataset on your machine, for example:
+
+```python
+base_config=DataConfig(
+    prompt_from_task=True,
+    local_files_path="/data/Posttraining-RFM-RSS2026/Challenge-phase1-dataset/insert-mouse-battery/expert-data",
+),
+```
+
+### 2. Set environment variables
+
+Edit [`setup_env.sh`](setup_env.sh) to match your cluster:
+
+```bash
+export OPENPI_DATA_HOME=...   # where pretrained checkpoints are downloaded
+export HF_LEROBOT_HOME=...    # LeRobot dataset cache
+export HF_HOME=...            # HuggingFace model cache
+```
+
+`train.sh` sources this file automatically, so there is no need to `source` it manually before training.
+
+### 3. Run training
+
+Launch a baseline run with one of the three challenge config names:
+
+```bash
+bash train.sh pi05_insert-mouse-battery
+```
+
+`train.sh` does two things in order:
+
+1. `scripts/compute_norm_stats.py` — computes per-dataset normalization statistics.
+2. `scripts/train.py` — runs the training loop and tees logs to `logs/<config>_<timestamp>.log`.
+
+Normalization stats only need to be computed once per dataset. If `assets/<config>/norm_stats.json` already exists, you can comment out the `compute_norm_stats.py` line in `train.sh` to skip recomputation.
+
+---
+
 # openpi
 
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
