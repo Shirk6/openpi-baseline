@@ -8,6 +8,16 @@ This repository is the baseline for the RSS 2026 Post-Training for Robot Foundat
 
 Follow the three steps below to reproduce the baseline.
 
+### 0. Quick Environment Setup
+```bash
+git clone https://github.com/posttraining-for-robotics/openpi-baseline.git
+
+cd openpi-baseline
+
+GIT_LFS_SKIP_SMUDGE=1 uv sync
+GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+```
+
 ### 1. Configure dataset paths
 
 Open [`src/openpi/training/config.py`](src/openpi/training/config.py) and edit the three challenge configs at **lines 615-660**. Replace the `/Your/path/to/...` placeholder in each config's `local_files_path` with the actual location of the challenge dataset on your machine, for example:
@@ -29,6 +39,7 @@ export HF_LEROBOT_HOME=...    # LeRobot dataset cache
 export HF_HOME=...            # HuggingFace model cache
 ```
 
+For `HF_LEROBOT_HOME`, the normal path is `Your/path/to/Posttraining-RFM-RSS2026/Challenge-phase1-dataset`
 `train.sh` sources this file automatically, so there is no need to `source` it manually before training.
 
 ### 3. Run training
@@ -45,6 +56,30 @@ bash train.sh pi05_insert-mouse-battery
 2. `scripts/train.py` — runs the training loop and tees logs to `logs/<config>_<timestamp>.log`.
 
 Normalization stats only need to be computed once per dataset. If `assets/<config>/norm_stats.json` already exists, you can comment out the `compute_norm_stats.py` line in `train.sh` to skip recomputation.
+
+### 4. Merging datasets (optional)
+
+Some recipes — DAgger-style retraining on `expert + rollout` data, or training a single multi-task generalist across all three challenge tasks — require concatenating several LeRobot-format repos into one. We provide [`scripts/merge_lerobot.py`](scripts/merge_lerobot.py) for this. It re-indexes `episode_index` / global frame `index`, copies parquet and videos, merges `tasks.jsonl`, and writes `meta/sources.jsonl` recording the per-source episode range for provenance.
+
+Pass sources either inline or via a list file:
+
+```bash
+# Inline
+uv run scripts/merge_lerobot.py \
+    --src_paths /path/to/expert-data /path/to/rollout-data \
+    --tgt_path  /path/to/merged \
+    --repo_id   insert-mouse-battery/merged
+
+# Or with a newline-separated list file ('#' for comments)
+uv run scripts/merge_lerobot.py \
+    --src_list  merge_list.txt \
+    --tgt_path  /path/to/merged \
+    --repo_id   challenge/multitask-generalist
+```
+
+`fps`, `robot_type`, and `features` are inferred from the first source. Use `--force` to allow merging across minor metadata conflicts. After merging, register the new repo as a fresh `TrainConfig` (or point an existing one's `local_files_path` at the merged directory) and run training as in steps 1-3.
+
+This script refers to the implementation in [kai0](https://github.com/OpenDriveLab/kai0).
 
 ---
 
