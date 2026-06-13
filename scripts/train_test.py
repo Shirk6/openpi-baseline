@@ -2,6 +2,8 @@ import dataclasses
 import os
 import pathlib
 
+import jax.numpy as jnp
+import numpy as np
 import pytest
 
 os.environ["JAX_PLATFORMS"] = "cpu"
@@ -9,6 +11,34 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 from openpi.training import config as _config
 
 from . import train
+
+
+def test_reduce_chunked_loss_unweighted_and_weighted():
+    chunked_loss = jnp.asarray([[1.0, 3.0], [5.0, 7.0]])
+    loss_weights = jnp.asarray([[1.0, 1.0], [0.0, 2.0]])
+
+    np.testing.assert_allclose(train._reduce_chunked_loss(chunked_loss, None), 4.0)  # noqa: SLF001
+    np.testing.assert_allclose(
+        train._reduce_chunked_loss(chunked_loss, loss_weights, batch_normalize_weights=False), 4.5  # noqa: SLF001
+    )
+    np.testing.assert_allclose(
+        train._reduce_chunked_loss(chunked_loss, loss_weights, batch_normalize_weights=True), 4.5  # noqa: SLF001
+    )
+
+
+def test_reduce_chunked_loss_with_weights():
+    chunked_loss = jnp.asarray([[1.0, 3.0], [5.0, 7.0]])
+    weights = jnp.asarray([[2.0, 2.0], [0.0, 4.0]])
+
+    unweighted = train._reduce_chunked_loss(chunked_loss, None)  # noqa: SLF001
+    weighted = train._reduce_chunked_loss(chunked_loss, weights, batch_normalize_weights=False)  # noqa: SLF001
+    normalized_weighted = train._reduce_chunked_loss(
+        chunked_loss, weights, batch_normalize_weights=True
+    )  # noqa: SLF001
+
+    assert float(unweighted) == 4.0
+    assert float(weighted) == 9.0
+    assert float(normalized_weighted) == 4.5
 
 
 @pytest.mark.parametrize("config_name", ["debug"])

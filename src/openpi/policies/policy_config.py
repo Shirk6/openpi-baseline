@@ -8,7 +8,6 @@ import jax.numpy as jnp
 import openpi.models.model as _model
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
-from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
 import openpi.transforms as transforms
 
@@ -61,6 +60,8 @@ def create_trained_policy(
         # that the policy is using the same normalization stats as the original training process.
         if data_config.asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
+        from openpi.training import checkpoints as _checkpoints
+
         norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
 
     # Determine the device to use for PyTorch models

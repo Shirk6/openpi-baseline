@@ -1,6 +1,7 @@
 import dataclasses
 
 import jax
+import numpy as np
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
@@ -82,3 +83,25 @@ def test_with_real_dataset():
 
     for _, actions in batches:
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
+
+
+def test_hil_labeling_and_weights():
+    labels = _data_loader.compute_hil_labels(
+        ["inference", "inference", "inference", "teleop", "teleop", "inference"],
+        pre_intervention_frames=2,
+    )
+
+    assert labels.tolist() == [
+        "rollout",
+        "pre_intervention",
+        "pre_intervention",
+        "intervention",
+        "intervention",
+        "rollout",
+    ]
+    assert _data_loader.has_intervention_transition(np.asarray(["rollout", "intervention"]))
+    assert _data_loader.has_intervention_transition(np.asarray(["pre_intervention", "intervention"]))
+    assert not _data_loader.has_intervention_transition(np.asarray(["intervention", "intervention"]))
+
+    weights = _data_loader.labels_to_weights(labels, _config.WeightedBCConfig())
+    np.testing.assert_allclose(weights, np.asarray([1.0, 0.1, 0.1, 10.0, 10.0, 1.0], dtype=np.float32))

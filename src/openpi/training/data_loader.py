@@ -1,7 +1,10 @@
 from collections.abc import Iterator, Sequence
+import dataclasses
+import json
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -9,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
+import pyarrow.parquet as pq
 import torch
 
 import openpi.models.model as _model
@@ -17,6 +21,7 @@ from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
+TrainingBatch = tuple[_model.Observation, _model.Actions] | tuple[_model.Observation, _model.Actions, jax.Array]
 
 
 class Dataset(Protocol[T_co]):
@@ -57,6 +62,27 @@ class TransformedDataset(Dataset[T_co]):
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
         return self._transform(self._dataset[index])
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+
+class PreserveKeysDataset(Dataset[T_co]):
+    def __init__(
+        self,
+        dataset: Dataset,
+        transforms: Sequence[_transforms.DataTransformFn],
+        preserved_keys: Sequence[str],
+    ):
+        self._dataset = dataset
+        self._transform = _transforms.compose(transforms)
+        self._preserved_keys = tuple(preserved_keys)
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        item = self._dataset[index]
+        preserved = {key: item[key] for key in self._preserved_keys if key in item}
+        transformed = self._transform(item)
+        return {**transformed, **preserved}
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -127,8 +153,192 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+_DEMO_LABEL = "demo"
+_ROLLOUT_LABEL = "rollout"
+_INTERVENTION_LABEL = "intervention"
+_PRE_INTERVENTION_LABEL = "pre_intervention"
+
+
+def compute_hil_labels(
+    commander_states: Sequence[str], *, pre_intervention_frames: int
+) -> np.ndarray:
+    labels = np.full(len(commander_states), _ROLLOUT_LABEL, dtype=object)
+    states = np.asarray(commander_states)
+    intervention_mask = states == "teleop"
+    labels[intervention_mask] = _INTERVENTION_LABEL
+
+    intervention_starts = np.flatnonzero(intervention_mask & np.concatenate([[True], ~intervention_mask[:-1]]))
+    for start in intervention_starts:
+        pre_start = max(0, start - pre_intervention_frames)
+        pre_indices = np.arange(pre_start, start)
+        pre_indices = pre_indices[states[pre_indices] == "inference"]
+        labels[pre_indices] = _PRE_INTERVENTION_LABEL
+
+    return labels
+
+
+def labels_to_weights(labels: np.ndarray, weighted_bc: _config.WeightedBCConfig) -> np.ndarray:
+    weight_map = {
+        _DEMO_LABEL: weighted_bc.demo_weight,
+        _ROLLOUT_LABEL: weighted_bc.rollout_weight,
+        _INTERVENTION_LABEL: weighted_bc.intervention_weight,
+        _PRE_INTERVENTION_LABEL: weighted_bc.pre_intervention_weight,
+    }
+    return np.asarray([weight_map.get(label, weighted_bc.rollout_weight) for label in labels], dtype=np.float32)
+
+
+def has_intervention_transition(labels: np.ndarray) -> bool:
+    return bool(np.any((labels[:-1] != _INTERVENTION_LABEL) & (labels[1:] == _INTERVENTION_LABEL)))
+
+
+@dataclasses.dataclass(frozen=True)
+class _WeightedSource:
+    dataset: Dataset
+    valid_indices: np.ndarray
+    loss_weights: np.ndarray
+
+
+class ChallengeWeightedBCDataset(Dataset):
+    def __init__(
+        self,
+        sources: Sequence[_config.WeightedBCSourceConfig],
+        weighted_bc: _config.WeightedBCConfig,
+        action_horizon: int,
+        action_sequence_keys: Sequence[str],
+        *,
+        prompt_from_task: bool,
+        video_backend: str | None,
+    ):
+        self._sources = [
+            self._load_source(
+                source,
+                weighted_bc,
+                action_horizon,
+                action_sequence_keys,
+                prompt_from_task=prompt_from_task,
+                video_backend=video_backend,
+            )
+            for source in sources
+        ]
+        self._cumulative_sizes = np.cumsum([len(source.valid_indices) for source in self._sources])
+        if len(self) == 0:
+            raise ValueError("Weighted BC dataset has no valid samples.")
+
+    def _load_source(
+        self,
+        source: _config.WeightedBCSourceConfig,
+        weighted_bc: _config.WeightedBCConfig,
+        action_horizon: int,
+        action_sequence_keys: Sequence[str],
+        *,
+        prompt_from_task: bool,
+        video_backend: str | None,
+    ) -> _WeightedSource:
+        dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(source.repo_id, root=source.local_files_path)
+        dataset = lerobot_dataset.LeRobotDataset(
+            source.repo_id,
+            delta_timestamps={
+                key: [t / dataset_meta.fps for t in range(action_horizon)] for key in action_sequence_keys
+            },
+            root=source.local_files_path,
+            video_backend=video_backend,
+        )
+        if prompt_from_task:
+            dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+
+        labels_by_episode = self._load_labels_by_episode(source, weighted_bc)
+        weights = []
+        valid_indices = []
+        global_index = 0
+        for episode in _read_episodes(pathlib.Path(source.local_files_path)):
+            episode_index = int(episode["episode_index"])
+            episode_length = int(episode["length"])
+            episode_labels = labels_by_episode[episode_index]
+            for frame_index in range(episode_length):
+                labels = episode_labels[frame_index : frame_index + action_horizon]
+                if len(labels) < action_horizon:
+                    labels = np.pad(labels, (0, action_horizon - len(labels)), mode="edge")
+                if weighted_bc.drop_transition_chunks and has_intervention_transition(labels):
+                    continue
+                valid_indices.append(global_index + frame_index)
+                weights.append(labels_to_weights(labels, weighted_bc))
+            global_index += episode_length
+
+        return _WeightedSource(
+            dataset=dataset,
+            valid_indices=np.asarray(valid_indices, dtype=np.int64),
+            loss_weights=np.asarray(weights, dtype=np.float32),
+        )
+
+    def _load_labels_by_episode(
+        self, source: _config.WeightedBCSourceConfig, weighted_bc: _config.WeightedBCConfig
+    ) -> dict[int, np.ndarray]:
+        root = pathlib.Path(source.local_files_path)
+        labels_by_episode = {}
+        for episode in _read_episodes(root):
+            episode_index = int(episode["episode_index"])
+            if source.source_type == "demo":
+                labels_by_episode[episode_index] = np.full(int(episode["length"]), _DEMO_LABEL, dtype=object)
+                continue
+
+            parquet_path = episode_parquet_path(root, episode_index)
+            table = pq.read_table(parquet_path, columns=[weighted_bc.mode_key])
+            commander_states = table[weighted_bc.mode_key].to_pylist()
+            labels_by_episode[episode_index] = compute_hil_labels(
+                commander_states, pre_intervention_frames=weighted_bc.pre_intervention_frames
+            )
+
+        return labels_by_episode
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        index = index.__index__()
+        source_index = int(np.searchsorted(self._cumulative_sizes, index, side="right"))
+        source_start = 0 if source_index == 0 else self._cumulative_sizes[source_index - 1]
+        index_in_source = index - source_start
+        source = self._sources[source_index]
+
+        item = dict(source.dataset[int(source.valid_indices[index_in_source])])
+        item["loss_weights"] = source.loss_weights[index_in_source]
+        return item
+
+    def __len__(self) -> int:
+        return int(self._cumulative_sizes[-1])
+
+
+def _read_episodes(root: pathlib.Path) -> list[dict]:
+    episodes_path = root / "meta" / "episodes.jsonl"
+    with episodes_path.open() as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def episode_parquet_path(root: str | pathlib.Path, episode_index: int) -> pathlib.Path:
+    root = pathlib.Path(root)
+    info_path = root / "meta" / "info.json"
+    if info_path.is_file():
+        with info_path.open() as f:
+            info = json.load(f)
+        data_path = info.get("data_path")
+        if data_path is not None:
+            chunks_size = int(info.get("chunks_size", 1000))
+            episode_chunk = episode_index // chunks_size
+            parquet_path = root / data_path.format(episode_chunk=episode_chunk, episode_index=episode_index)
+            if parquet_path.is_file():
+                return parquet_path
+
+    parquet_name = f"episode_{episode_index:06d}.parquet"
+    matches = sorted((root / "data").glob(f"chunk-*/{parquet_name}"))
+    if matches:
+        return matches[0]
+
+    return root / "data" / "chunk-000" / parquet_name
+
+
 def create_torch_dataset(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    model_config: _model.BaseModelConfig,
+    *,
+    weighted_bc: _config.WeightedBCConfig | None = None,
 ) -> Dataset:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
@@ -136,6 +346,17 @@ def create_torch_dataset(
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
+    if weighted_bc is not None and weighted_bc.enabled:
+        if not data_config.weighted_bc_sources:
+            raise ValueError("Weighted BC is enabled but data_config.weighted_bc_sources is empty.")
+        return ChallengeWeightedBCDataset(
+            data_config.weighted_bc_sources,
+            weighted_bc,
+            action_horizon,
+            data_config.action_sequence_keys,
+            prompt_from_task=data_config.prompt_from_task,
+            video_backend=data_config.video_backend,
+        )
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.local_files_path)
     dataset = lerobot_dataset.LeRobotDataset(
@@ -143,7 +364,8 @@ def create_torch_dataset(
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
-        root=data_config.local_files_path
+        root=data_config.local_files_path,
+        video_backend=data_config.video_backend,
     )
 
     if data_config.prompt_from_task:
@@ -170,7 +392,13 @@ def create_rlds_dataset(
     )
 
 
-def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
+def transform_dataset(
+    dataset: Dataset,
+    data_config: _config.DataConfig,
+    *,
+    skip_norm_stats: bool = False,
+    preserve_loss_weights: bool = False,
+) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
@@ -181,15 +409,15 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             )
         norm_stats = data_config.norm_stats
 
-    return TransformedDataset(
-        dataset,
-        [
-            *data_config.repack_transforms.inputs,
-            *data_config.data_transforms.inputs,
-            _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
-            *data_config.model_transforms.inputs,
-        ],
-    )
+    transforms = [
+        *data_config.repack_transforms.inputs,
+        *data_config.data_transforms.inputs,
+        _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+        *data_config.model_transforms.inputs,
+    ]
+    if preserve_loss_weights:
+        return PreserveKeysDataset(dataset, transforms, preserved_keys=("loss_weights",))
+    return TransformedDataset(dataset, transforms)
 
 
 def transform_iterable_dataset(
@@ -229,7 +457,7 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+) -> DataLoader[TrainingBatch]:
     """Create a data loader for training.
 
     Args:
@@ -266,6 +494,7 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
+        weighted_bc=config.weighted_bc,
     )
 
 
@@ -282,7 +511,8 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    weighted_bc: _config.WeightedBCConfig | None = None,
+) -> DataLoader[TrainingBatch]:
     """Create a data loader for training.
 
     Args:
@@ -300,8 +530,14 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    weighted_bc = weighted_bc or _config.WeightedBCConfig()
+    dataset = create_torch_dataset(data_config, action_horizon, model_config, weighted_bc=weighted_bc)
+    dataset = transform_dataset(
+        dataset,
+        data_config,
+        skip_norm_stats=skip_norm_stats,
+        preserve_loss_weights=weighted_bc.enabled,
+    )
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
@@ -348,7 +584,7 @@ def create_rlds_data_loader(
     shuffle: bool = False,
     num_batches: int | None = None,
     framework: str = "jax",
-) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+) -> DataLoader[TrainingBatch]:
     """Create an RLDS data loader for training.
 
     Note: This data loader requires some extra dependencies -- see examples/droid/README_train.md
@@ -538,4 +774,11 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            batch = dict(batch)
+            actions = batch["actions"]
+            loss_weights = batch.pop("loss_weights", None)
+            observation = _model.Observation.from_dict(batch)
+            if loss_weights is None:
+                yield observation, actions
+            else:
+                yield observation, actions, loss_weights

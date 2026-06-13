@@ -62,6 +62,26 @@ class AssetsConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class WeightedBCConfig:
+    enabled: bool = False
+    mode_key: str = "observation.commander_state"
+    pre_intervention_frames: int = 15
+    demo_weight: float = 1.0
+    rollout_weight: float = 0.6
+    intervention_weight: float = 10.0
+    pre_intervention_weight: float = 0.1
+    batch_normalize: bool = True
+    drop_transition_chunks: bool = True
+
+
+@dataclasses.dataclass(frozen=True)
+class WeightedBCSourceConfig:
+    repo_id: str
+    local_files_path: str
+    source_type: Literal["demo", "hil"]
+
+
+@dataclasses.dataclass(frozen=True)
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
@@ -89,6 +109,8 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+    # LeRobot video decoder backend. Use pyav by default because torchcodec requires system FFmpeg shared libs.
+    video_backend: Literal["pyav", "torchcodec", "video_reader"] | None = "pyav"
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -97,6 +119,7 @@ class DataConfig:
     # Path to the data filter file for DROID dataset
     filter_dict_path: str | None = None
     local_files_path: str | None = None
+    weighted_bc_sources: Sequence[WeightedBCSourceConfig] = ()
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -339,6 +362,39 @@ class DualYamDataConfig(DataConfigFactory):
             action_sequence_keys=self.action_sequence_keys,
         )
 
+
+@dataclasses.dataclass(frozen=True)
+class ChallengeWeightedBCDataConfig(DualYamDataConfig):
+    """Dual-YAM data config that trains on expert and successful HIL Challenge subsets."""
+
+    task_name: str = tyro.MISSING
+    dataset_root: str = "/project/peilab/srk/rss_2026_ws/Challenge-phase1-dataset"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_config = super().create(assets_dirs, model_config)
+        expert_repo_id = f"{self.task_name}/expert-data"
+        hil_repo_id = f"{self.task_name}/success-and-hil-data"
+        return dataclasses.replace(
+            data_config,
+            repo_id=f"{self.task_name}/weighted-bc",
+            asset_id=f"{self.task_name}/weighted-bc",
+            local_files_path=str(pathlib.Path(self.dataset_root) / self.task_name / "expert-data"),
+            weighted_bc_sources=(
+                WeightedBCSourceConfig(
+                    repo_id=expert_repo_id,
+                    local_files_path=str(pathlib.Path(self.dataset_root) / self.task_name / "expert-data"),
+                    source_type="demo",
+                ),
+                WeightedBCSourceConfig(
+                    repo_id=hil_repo_id,
+                    local_files_path=str(pathlib.Path(self.dataset_root) / self.task_name / "success-and-hil-data"),
+                    source_type="hil",
+                ),
+            ),
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class LeRobotLiberoDataConfig(DataConfigFactory):
     """
@@ -548,6 +604,9 @@ class TrainConfig:
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
 
+    # Optional loss weighting for human-in-the-loop behavioral cloning.
+    weighted_bc: WeightedBCConfig = dataclasses.field(default_factory=WeightedBCConfig)
+
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
     # Base directory for checkpoints.
@@ -656,6 +715,57 @@ _CONFIGS = [
         batch_size=32,
         num_workers=64,
         save_interval=40_000
+    ),
+    TrainConfig(
+        name="pi05_insert-mouse-battery_weighted_bc",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=ChallengeWeightedBCDataConfig(
+            repo_id="insert-mouse-battery/weighted-bc",
+            task_name="insert-mouse-battery",
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weighted_bc=WeightedBCConfig(enabled=True),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=200_000,
+        batch_size=32,
+        num_workers=64,
+        save_interval=40_000,
+    ),
+    TrainConfig(
+        name="pi05_seal-water-bottle-cap_weighted_bc",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=ChallengeWeightedBCDataConfig(
+            repo_id="seal-water-bottle-cap/weighted-bc",
+            task_name="seal-water-bottle-cap",
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weighted_bc=WeightedBCConfig(enabled=True),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=200_000,
+        batch_size=32,
+        num_workers=64,
+        save_interval=40_000,
+    ),
+    TrainConfig(
+        name="pi05_tower-of-hanoi-game_weighted_bc",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=ChallengeWeightedBCDataConfig(
+            repo_id="tower-of-hanoi-game/weighted-bc",
+            task_name="tower-of-hanoi-game",
+            base_config=DataConfig(prompt_from_task=True),
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weighted_bc=WeightedBCConfig(enabled=True),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=200_000,
+        batch_size=32,
+        num_workers=64,
+        save_interval=40_000,
     ),
     #
     # Inference Aloha configs.
